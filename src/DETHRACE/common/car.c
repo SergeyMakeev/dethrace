@@ -2151,9 +2151,886 @@ void DoBumpiness(tCar_spec* c, br_vector3* wheel_pos, br_vector3* norm, br_scala
     d[n] = delta * mat_list[c->material_index[n]].bumpiness / 42400.0f * norm[n].v[1] + d[n];
 }
 
+//
+// ChatGPT version of CalcForce function (see below for original)
+// 
+// Compute all forces from suspension, tyres, gravity / downforce, traction control, etc.
+// Updates car->v (linear velocity) and car->omega (angular velocity), plus a bunch of state.
+void CalcForce_ChatGpt(tCar_spec* car, br_scalar dt) {
+    // ---- Basic constants / wheel indexing helpers ----
+    enum {
+        WHEEL_RL = 0, // rear-left
+        WHEEL_RR = 1, // rear-right
+        WHEEL_FL = 2, // front-left
+        WHEEL_FR = 3  // front-right
+    };
+
+    int i;
+    int numContactNormals = 0;
+
+    // Per-wheel vertical (suspension) force and ground distance
+    br_scalar wheelNormalForce[4];
+    br_scalar wheelGroundDist[4];
+
+    // Misc scalar temporaries
+    br_scalar ts;
+    br_scalar ts2;
+    br_scalar ts3;
+    br_scalar deltaOmega;
+    br_scalar wheelLoadRatioFrontToRear;
+    br_scalar frictionMass;
+    br_scalar maxRearLeftFriction;
+    br_scalar maxRearRightFriction;
+    br_scalar maxFrontLeftFriction;
+    br_scalar maxFrontRightFriction;
+    br_scalar maxRetardation; // (braking)
+    br_scalar frontRetardation;
+    br_scalar frictionNumber;
+
+    // Vectors in car space
+    br_vector3 upDirWorld; // "b" in original: up direction in world, transformed from car matrix
+    br_vector3 tmpVec;
+    br_vector3 tmpVec2;
+    br_vector3 wheelNormalCar[4]; // normals in car space
+    br_vector3 netForceCar;       // "B" - accumulated net force in car space
+    br_vector3 netTorqueCar;      // "f" - accumulated torque in car space
+    br_vector3 tmpTorqueVec;
+
+    br_vector3 wheelWorldPos[4]; // wheel contact positions in world space
+    br_vector3 roadPlaneVel;     // velocity projected into the road plane (no component along normal)
+    br_vector3 rightDirOnRoad;   // local "right" direction in the road plane
+    br_vector3 tangentDirOnRoad; // direction orthogonal to road_normal & rightDirOnRoad
+
+    br_vector3 rearForceDir;  // combination of lateral/longitudinal directions at rear axle
+    br_vector3 frontForceDir; // combination of lateral/longitudinal directions at front axle
+
+    // Downforce / slope / water volumes etc
+    tSpecial_volume* volume = car->last_special_volume;
+    br_matrix34* carMatrix = &car->car_master_actor->t.t.mat;
+    tMaterial_modifiers* matMods = gCurrent_race.material_modifiers;
+
+    // Static "stop when at rest" timer and slide distance
+    static br_scalar stopTimer = 0.0f;
+    static br_scalar slideDist = 0.0f;
+
+    // Oil / grip modifiers per wheel (0..1 range typically)
+    br_scalar flOilFactor, frOilFactor, rlOilFactor, rrOilFactor;
+
+    // Damage & misc
+    tDamage_type damageType;
+    br_scalar speedOnSurface;
+    br_scalar scale;
+
+    // ---- Init accumulators ----
+    BrVector3Set(&rearForceDir, 0, 0, 0); // reused later as temporary
+    BrVector3Set(&netForceCar, 0, 0, 0);
+    BrVector3Set(&netTorqueCar, 0, 0, 0);
+
+    // Up direction in world from car matrix (negative row 1)
+    upDirWorld.v[0] = -carMatrix->m[1][0];
+    upDirWorld.v[1] = -carMatrix->m[1][1];
+    upDirWorld.v[2] = -carMatrix->m[1][2];
+
+    // Reset material indices (per wheel)
+    car->material_index[0] = 0;
+    car->material_index[1] = 0;
+    car->material_index[2] = 0;
+    car->material_index[3] = 0;
+
+    // Ratio of rear axle height to front axle height (used in weight transfer math)
+    wheelLoadRatioFrontToRear = (car->wpos[WHEEL_FL].v[2] - car->cmpos.v[2]) / (car->wpos[WHEEL_RL].v[2] - car->cmpos.v[2]);
+
+    // Reset road normal (will be accumulated from wheel contact normals)
+    BrVector3Set(&car->road_normal, 0, 0, 0);
+
+    // ---- Transform wheel positions into world space ----
+    for (i = 0; i < 4; ++i) {
+        BrMatrix34ApplyP(&wheelWorldPos[i], &car->wpos[i], carMatrix);
+    }
+
+    // ---- Query ground under each wheel, in a single call ----
+    // Fills: car->nor[i] (world normals), wheelGroundDist[i], car->material_index[i]
+    MultiFindFloorInBoxM(4, wheelWorldPos,
+        &upDirWorld,
+        car->nor,
+        wheelGroundDist,
+        car,
+        car->material_index);
+
+    // Override material from special volume if present
+    if (volume && volume->material_modifier_index) {
+        int matIndex = volume->material_modifier_index;
+        car->material_index[0] = matIndex;
+        car->material_index[1] = matIndex;
+        car->material_index[2] = matIndex;
+        car->material_index[3] = matIndex;
+    }
+
+    // ---- Suspension forces / road normal accumulation ----
+    for (i = 0; i < 4; ++i) {
+        // Transform normal back into car space
+        BrMatrix34TApplyV(&wheelNormalCar[i], &car->nor[i], carMatrix);
+
+        // Add surface bumpiness perturbation, if any
+        if (matMods[car->material_index[i]].bumpiness != 0.0) {
+            DoBumpiness(car, wheelWorldPos, wheelNormalCar, wheelGroundDist, i);
+        }
+
+        // Check if wheel is too far above or below suspension range
+        if (wheelGroundDist[i] < -0.5f || car->wheel_dam_offset[i ^ 2] * 6.9f + car->susp_height[i / 2] < wheelGroundDist[i]) {
+
+            // Wheel is off the ground / outside suspension range
+            wheelNormalForce[i] = 0.0f;
+            wheelGroundDist[i] = car->susp_height[i / 2];
+
+        } else {
+            // Wheel is within suspension travel; compute spring + damper force
+
+            // Accumulate unnormalized road normal; normalized later
+            BrVector3Accumulate(&car->road_normal, &wheelNormalCar[i]);
+            numContactNormals++;
+
+            // Apply "damage offset" to suspension travel
+            wheelGroundDist[i] = wheelGroundDist[i] - car->wheel_dam_offset[i ^ 2] * 6.9f;
+
+            // Spring force: (restLength - actualLength) * stiffness
+            wheelNormalForce[i] = (car->susp_height[i / 2] - wheelGroundDist[i]) * car->sk[1 / 2];
+
+            // Damper force: proportional to rate of change of suspension travel
+            wheelNormalForce[i] -= (wheelGroundDist[i] - car->oldd[i]) / dt * car->sb[i / 2];
+
+            // Clamp very large forces on "neutral" suspension (to avoid excessive launch)
+            if (car->susp_height[i / 2] == car->oldd[i] && BrVector3Dot(&car->nor[i], &car->v) > -0.01f && car->M * 20.0f / 4.0f < wheelNormalForce[i]) {
+
+                wheelGroundDist[i] = car->susp_height[i / 2];
+                wheelNormalForce[i] = car->M * 20.0f / 4.0f;
+            }
+
+            if (wheelNormalForce[i] < 0.0f) {
+                wheelNormalForce[i] = 0.0f;
+            }
+
+            // Total upward force (Y in car space)
+            netForceCar.v[1] += wheelNormalForce[i];
+
+            // Suspension forces produce pitch / roll torques around the car's CM
+            // Here f is actually a torque accumulator.
+            netTorqueCar.v[0] -= (car->wpos[i].v[2] - car->cmpos.v[2]) * wheelNormalForce[i];
+            netTorqueCar.v[2] += (car->wpos[i].v[0] - car->cmpos.v[0]) * wheelNormalForce[i];
+        }
+
+        // Store last suspension compression for damping next frame
+        car->oldd[i] = wheelGroundDist[i];
+    }
+
+    // ---- Add gravity / wall-climb support ----
+    if (car->driver <= eDriver_non_car || !car->wall_climber_mode || (car->road_normal.v[0] == 0.0f && car->road_normal.v[1] == 0.0f && car->road_normal.v[2] == 0.0f)) {
+
+        // Normal gravity case (or no road normal yet)
+        if (volume) {
+            // Water / special volume modifies "effective mass" along gravity direction
+            frictionMass = (1.0f - volume->gravity_multiplier) * car->water_depth_factor;
+            if (car->underwater_ability) {
+                frictionMass *= 0.6f;
+            }
+            frictionMass = (1.0f - frictionMass) * car->M;
+        } else {
+            frictionMass = car->M;
+        }
+
+        frictionMass *= gGravity_multiplier * 10.0f; // 10 m/s^2 local gravity
+
+        // Apply gravity in *car* space: carMatrix's column 1 is up vector
+        netForceCar.v[0] -= carMatrix->m[0][1] * frictionMass;
+        netForceCar.v[1] -= carMatrix->m[1][1] * frictionMass;
+        netForceCar.v[2] -= carMatrix->m[2][1] * frictionMass;
+
+    } else {
+        // Wall-climber mode: use road_normal as "gravity" direction
+        br_vector3 climbForce;
+        BrVector3Normalise(&climbForce, &car->road_normal);
+        BrVector3Scale(&climbForce, &climbForce, -(car->M * 10.0f));
+        BrVector3Accumulate(&netForceCar, &climbForce);
+    }
+
+    // Steering auto-centering for human players in net games
+    if (car->driver >= eDriver_net_human) {
+        SteeringSelfCentre(car, dt, &car->road_normal);
+    }
+
+    // ---- If we have at least one wheel touching, do tyre forces ----
+    if (numContactNormals) {
+
+        // Normalize accumulated road normal
+        BrVector3NormaliseQuick(&car->road_normal, &car->road_normal);
+
+        // Project road normal onto world "up" to measure slope / angle
+        frictionNumber = car->road_normal.v[1] * carMatrix->m[1][1] + car->road_normal.v[2] * carMatrix->m[2][1] + car->road_normal.v[0] * carMatrix->m[0][1];
+
+        // Wall-climber can force full "downforce"
+        if (car->driver > eDriver_non_car && car->wall_climber_mode) {
+            frictionNumber = 1.0f;
+        }
+
+        // Base downforce coefficient from material
+        frictionNumber *= matMods[car->material_index[0]].down_force;
+
+        // ---- Downforce & "bottoming out" detection ----
+        if (frictionNumber > 0.0f) {
+            // Downforce grows with speed (velocity in car space Z)
+            frictionNumber = fabs(car->velocity_car_space.v[2]) * car->M * 10.0f * frictionNumber / car->down_force_speed;
+
+            // Clamp to weight
+            if (frictionNumber > car->M * 10.0f) {
+                frictionNumber = car->M * 10.0f;
+            }
+
+            // Check for front wheels having full suspension travel (used to
+            // detect when aero downforce would "bottom" the front)
+            if (car->number_of_wheels_on_ground == 4 && car->oldd[WHEEL_FL] == car->susp_height[1] && car->oldd[WHEEL_FR] == car->susp_height[1]) {
+
+                // Test the line between front and rear along upDirWorld for floor intersection
+                br_vector3 start, dir;
+                start.v[0] = car->wpos[WHEEL_FL].v[2] * carMatrix->m[2][0];
+                start.v[1] = car->wpos[WHEEL_FL].v[2] * carMatrix->m[2][1];
+                start.v[2] = car->wpos[WHEEL_FL].v[2] * carMatrix->m[2][2];
+                BrVector3Accumulate(&start, (br_vector3*)&carMatrix->m[3]);
+
+                BrVector3Scale(&dir, &upDirWorld,
+                    (car->wpos[WHEEL_RL].v[2] - car->wpos[WHEEL_FL].v[2]));
+
+                br_scalar floorT;
+                findfloor(&start, &dir, wheelNormalCar, &floorT);
+                if (floorT > 1.0f) {
+                    car->down_force_flag = 1;
+                }
+            } else if (car->down_force_flag && (car->oldd[WHEEL_FL] < car->susp_height[1] || car->oldd[WHEEL_FR] < car->susp_height[1])) {
+                car->down_force_flag = 0;
+            }
+
+            // If downforce is allowed (nose close enough to ground),
+            // apply front-biased downforce to suspension and torque
+            if (car->down_force_flag) {
+                br_scalar frontFactor = (car->wpos[WHEEL_FL].v[2] - car->cmpos.v[2]) / (car->wpos[WHEEL_FL].v[2] - car->wpos[WHEEL_RL].v[2]);
+
+                br_scalar dfFront = frontFactor * frictionNumber;
+                netTorqueCar.v[0] += (car->wpos[WHEEL_RL].v[2] - car->cmpos.v[2]) * dfFront;
+            }
+
+            // Downforce acts as an extra vertical force on the body (negative Y in car space)
+            netForceCar.v[1] -= frictionNumber;
+        }
+
+        // ---- Compute velocity projected into road plane (vplane) ----
+        {
+            br_scalar vDotN = BrVector3Dot(&car->velocity_car_space, &car->road_normal);
+
+            tmpVec.v[0] = vDotN * car->road_normal.v[0];
+            tmpVec.v[1] = vDotN * car->road_normal.v[1];
+            tmpVec.v[2] = vDotN * car->road_normal.v[2];
+
+            BrVector3Sub(&roadPlaneVel, &car->velocity_car_space, &tmpVec);
+        }
+
+        // Determine sign for curvature (which way we're turning)
+        if (roadPlaneVel.v[2] < 0.0f) {
+            ts = 1.0f;
+        } else {
+            ts = -1.0f;
+        }
+
+        // Magnitude of velocity in the plane
+        ts3 = BrVector3Length(&roadPlaneVel);
+
+        // Desired angular velocity from curvature and speed
+        deltaOmega = ts3 * car->curvature * ts;
+
+        // Difference from actual angular velocity around road normal
+        deltaOmega -= BrVector3Dot(&car->omega, &car->road_normal);
+
+        // TangentDir: perpendicular to road_normal in X-Y plane of car
+        BrVector3Set(&tangentDirOnRoad,
+            car->road_normal.v[1],
+            -car->road_normal.v[0],
+            0.0f);
+        BrVector3Normalise(&tangentDirOnRoad, &tangentDirOnRoad);
+
+        // Required *angular* correction torque about I.y
+        frictionNumber = car->I.v[1] / dt * deltaOmega;
+
+        // Convert to per-axle contributions based on front/rear height separation
+        br_scalar axleSeparation = (car->wpos[WHEEL_FL].v[2] - car->wpos[WHEEL_RL].v[2]);
+        br_scalar rearAxleYawContribution = frictionNumber / axleSeparation;
+        br_scalar frontAxleYawContribution = -rearAxleYawContribution;
+
+        // Right direction in road plane
+        BrVector3Set(&rightDirOnRoad,
+            0.0f,
+            car->road_normal.v[2],
+            -car->road_normal.v[1]);
+        BrVector3Normalise(&rightDirOnRoad, &rightDirOnRoad);
+
+        // Rear longitudinal "request" force (from engine/brake) - original v99
+        br_scalar rearLongitudinalRequest = car->acc_force;
+
+        // Decompose plane velocity into right & tangential components
+        br_scalar vRight = BrVector3Dot(&rightDirOnRoad, &roadPlaneVel);
+        br_scalar vTangent = BrVector3Dot(&tangentDirOnRoad, &roadPlaneVel);
+        br_scalar absVTan = fabs(vTangent);
+
+        // Some weird curvature coupling term between right & tangent for yaw
+        br_scalar curvatureCoupling = (car->wpos[WHEEL_RL].v[2] - car->cmpos.v[2]) * vRight * fabs(car->curvature);
+
+        if (car->curvature <= 0.0f) {
+            curvatureCoupling = vTangent - curvatureCoupling;
+        } else {
+            curvatureCoupling = vTangent + curvatureCoupling;
+        }
+
+        // Convert this into a "force like" demand along tangentDirOnRoad
+        br_scalar tangentForceDemand = -(car->M / dt * curvatureCoupling) - BrVector3Dot(&netForceCar, &tangentDirOnRoad);
+
+        // Split between front/rear wheels using wheelLoadRatio
+        tangentForceDemand /= (1.0f - wheelLoadRatioFrontToRear);
+
+        br_scalar rearLateralRequest = rearAxleYawContribution + tangentForceDemand;
+        br_scalar frontLateralRequest = frontAxleYawContribution - wheelLoadRatioFrontToRear * tangentForceDemand;
+
+        // Convert rear lateral request into a moment about CM
+        br_scalar rearLateralMoment = (car->wpos[WHEEL_RL].v[2] - car->cmpos.v[2]) * rearLateralRequest * car->curvature;
+
+        // Request for lateral force in rightDirOnRoad based on velocity
+        br_scalar lateralVelocityForce = BrVector3Dot(&car->velocity_car_space, &rightDirOnRoad) * car->M / dt;
+
+        br_scalar rearAxisLateralDemand = BrVector3Dot(&rightDirOnRoad, &netForceCar) + lateralVelocityForce;
+
+        // Split braking/engine force between rear and front tyres,
+        // taking into account mu / friction ellipticity.
+        br_scalar rearBrakeShare = car->mu[0] * car->brake_force / (car->mu[1] / car->friction_elipticity + car->mu[0]);
+
+        br_scalar frontBrakeShare = car->brake_force - rearBrakeShare;
+
+        // Damage reduces brake force effectiveness
+        {
+            int rearBrakeDamage = (car->damage_units[7].damage_level + car->damage_units[6].damage_level) / 2;
+            if (rearBrakeDamage > 20) {
+                br_scalar scale = 1.0f - (br_scalar)(rearBrakeDamage - 20) / 80.0f;
+                rearBrakeShare *= scale * scale;
+            }
+
+            int frontBrakeDamage = (car->damage_units[5].damage_level + car->damage_units[4].damage_level) / 2;
+            if (frontBrakeDamage > 20) {
+                br_scalar scale = 1.0f - (br_scalar)(frontBrakeDamage - 20) / 80.0f;
+                frontBrakeShare *= scale * scale;
+            }
+        }
+
+        // Rolling resistance + brake forces per axle
+        br_scalar rearLongitudinalFriction = (wheelNormalForce[WHEEL_RL] + wheelNormalForce[WHEEL_RR]) * car->rolling_r_back + rearBrakeShare;
+
+        br_scalar frontLongitudinalFriction = (wheelNormalForce[WHEEL_FL] + wheelNormalForce[WHEEL_FR]) * car->rolling_r_front + frontBrakeShare;
+
+        // Combine with curvature to get effective front contribution
+        br_scalar verticalOffset = car->wpos[WHEEL_RL].v[2] - car->wpos[WHEEL_FL].v[2];
+        br_scalar curvatureFactor = sqrt(verticalOffset * verticalOffset * car->curvature * car->curvature + 1.0f);
+        br_scalar frontLongitudinalEffective = frontLongitudinalFriction / curvatureFactor;
+
+        // Combined rear axis requested longitudinal + front coupling
+        br_scalar totalLongitudinalFriction = rearLongitudinalFriction + frontLongitudinalEffective;
+
+        // Saturate requested lateral/longitudinal demands to what the tyre can
+        // actually deliver (rear axle only in this block)
+        if (fabs(rearAxisLateralDemand) < fabs(totalLongitudinalFriction)) {
+            br_scalar scale = rearAxisLateralDemand / totalLongitudinalFriction;
+            rearLongitudinalFriction *= scale;
+            frontLongitudinalEffective *= scale;
+        }
+
+        // Ensure directions of total demand and axis demand are compatible
+        if ((frontLongitudinalFriction + rearLongitudinalFriction) * rearAxisLateralDemand < 0.0f) {
+            rearLongitudinalFriction = -rearLongitudinalFriction;
+            frontLongitudinalEffective = -frontLongitudinalEffective;
+        }
+
+        // Remaining "unmatched" lateral demand along rightDirOnRoad
+        rearAxisLateralDemand -= (rearLongitudinalFriction + frontLongitudinalEffective);
+
+        // Remove used part from acceleration request
+        rearLongitudinalRequest -= rearLongitudinalFriction;
+
+        // If braking and brakes not too damaged, convert remaining lateral demand to braking
+        if (car->keys.brake && car->damage_units[eDamage_lr_brake].damage_level < 60 && car->damage_units[eDamage_rr_brake].damage_level < 60) {
+
+            rearLongitudinalRequest -= rearAxisLateralDemand;
+            car->gear = 0; // neutral
+        }
+
+        // Apply "friction ellipticity" shaping to longitudinal vs lateral
+        rearLongitudinalRequest /= car->friction_elipticity;
+
+        // Combined magnitude (rear axle) - used as "radius" in friction ellipse
+        br_scalar rearCombinedMagnitude = sqrt(rearLongitudinalRequest * rearLongitudinalRequest + frontLateralRequest * frontLateralRequest) * 0.5f;
+
+        // Oil / water grip modifiers
+        GetOilFrictionFactors(car, &flOilFactor, &frOilFactor,
+            &rlOilFactor, &rrOilFactor);
+
+        // Grip multiplier (robots/humans)
+        br_scalar gripMultiplier;
+        if (car->driver <= eDriver_non_car) {
+            gripMultiplier = 1.0f;
+        } else {
+            gripMultiplier = car->grip_multiplier;
+        }
+
+        // Compute instantaneous velocity at rear-left contact patch in car space:
+        // v = omega x r + v_cm
+        {
+            br_vector3 r;
+            BrVector3Sub(&r, &car->wpos[WHEEL_RL], &car->cmpos);
+            BrVector3Cross(&tmpVec, &car->omega, &r);
+            BrVector3Accumulate(&tmpVec, &car->velocity_car_space);
+        }
+
+        // ---- Lateral friction coefficient for rear axle (mu) ----
+        if (car->driver >= eDriver_net_human && (((car->keys.left || car->joystick.left > 0x8000) && car->curvature > 0.0f && deltaOmega > 0.1f && tmpVec.v[0] > 0.0f) || ((car->keys.right || car->joystick.right > 0x8000) && car->curvature < 0.0f && deltaOmega < 0.1f && tmpVec.v[0] < 0.0f)) && ts > 0.0f) {
+
+            // Player is "helping" the car turn, use high `u`
+            frictionNumber = car->mu[0];
+        } else {
+            // Blend between `u2` and `u0` based on lateral velocity at contact patch
+            frictionNumber = car->mu[2];
+            ts2 = fabs(tmpVec.v[0]) / 10.0f;
+            if (ts2 > 1.0f)
+                ts2 = 1.0f;
+            frictionNumber += (car->mu[2] - car->mu[0]) * ts2;
+        }
+
+        // Maximum rear tyre friction force (per wheel)
+        maxRearLeftFriction = sqrt(wheelNormalForce[WHEEL_RL]) * frictionNumber * (rlOilFactor * gripMultiplier) * matMods[car->material_index[WHEEL_RL]].tyre_road_friction;
+
+        maxRearRightFriction = sqrt(wheelNormalForce[WHEEL_RR]) * frictionNumber * (rrOilFactor * gripMultiplier) * matMods[car->material_index[WHEEL_RR]].tyre_road_friction;
+
+        car->max_force_rear = maxRearLeftFriction + maxRearRightFriction;
+
+        // ---- Traction control & wheelspin limiting for rear axle ----
+        if (rlOilFactor == 1.0f && rrOilFactor == 1.0f && car->traction_control && rearCombinedMagnitude * 2.0f > car->max_force_rear && car->acc_force > 0.0f && (car->driver < eDriver_net_human || (car->target_revs > 1000.0f && car->gear > 0))) {
+
+            // Requested force is above available friction, cut torque / adjust demand
+            br_scalar savedLongitudinal = rearLongitudinalRequest;
+
+            br_scalar ellipseR2 = rearCombinedMagnitude * rearCombinedMagnitude * 4.0f;
+            br_scalar lon2 = rearLongitudinalRequest * rearLongitudinalRequest;
+            br_scalar latComponent;
+
+            if (lon2 <= ellipseR2) {
+                latComponent = sqrt(ellipseR2 - lon2);
+            } else {
+                latComponent = 0.0f;
+            }
+
+            if (car->max_force_rear <= latComponent) {
+                // Massive wheelspin: kill engine torque aggressively
+                car->torque = -(car->revs * car->revs / 100000000.0f) - 0.1f;
+            } else {
+                br_scalar maxLongitudinal = sqrt(car->max_force_rear * car->max_force_rear - latComponent * latComponent);
+
+                br_scalar signLong = (savedLongitudinal < 0.0f) ? -1.0f : 1.0f;
+
+                br_scalar adjusted = (savedLongitudinal - signLong * maxLongitudinal) * 1.01f;
+
+                if (fabs(savedLongitudinal) > fabs(adjusted)) {
+                    savedLongitudinal = adjusted;
+                }
+            }
+
+            rearLongitudinalRequest -= savedLongitudinal;
+            rearCombinedMagnitude = sqrt(rearLongitudinalRequest * rearLongitudinalRequest + frontLateralRequest * frontLateralRequest) * 0.5f;
+
+        } else if (car->driver >= eDriver_net_human && car->gear > 0 && car->revs > car->target_revs && !car->traction_control) {
+
+            // Primitive traction control: reduce `u` when over-revving
+            if (!car->keys.change_down) {
+                car->traction_control = 1;
+            }
+
+            frictionNumber = 1.0f - (car->revs - car->target_revs) / (br_scalar)(400 * car->gear);
+
+            if (frictionNumber < 0.40000001f) {
+                frictionNumber = 0.40000001f;
+            }
+
+            maxRearLeftFriction *= frictionNumber;
+            maxRearRightFriction *= frictionNumber;
+        }
+
+        // ---- Clamp rear combined force to tyre friction ellipse ----
+        if (fabs(frontLateralRequest) > maxRearRightFriction + maxRearLeftFriction && maxRearRightFriction + maxRearLeftFriction > 0.1f) {
+
+            br_scalar scale = (maxRearRightFriction + maxRearLeftFriction) / fabs(frontLateralRequest) * dt;
+
+            frontLateralRequest *= scale;
+            rearLongitudinalRequest = car->friction_elipticity * scale * rearLongitudinalRequest;
+
+            // Compute some energy-like denominators
+            br_scalar denom = -(((car->wpos[WHEEL_FL].v[2] - car->cmpos.v[2]) * rearAxleYawContribution) * ((car->wpos[WHEEL_FL].v[2] - car->cmpos.v[2]) * rearAxleYawContribution) / car->I.v[1] + (rearLateralMoment * rearLateralMoment + rearAxleYawContribution * rearAxleYawContribution) / car->M);
+
+            br_scalar numer = (BrVector3Dot(&tangentDirOnRoad, &roadPlaneVel) + frontLateralRequest / car->M) * rearAxleYawContribution;
+
+            numer += BrVector3Dot(&rightDirOnRoad, &roadPlaneVel) * rearLateralMoment;
+            numer += BrVector3Dot(&car->omega, &car->road_normal) * (car->wpos[WHEEL_FL].v[2] - car->cmpos.v[2]) * rearAxleYawContribution;
+
+            numer += (car->wpos[WHEEL_RL].v[2] - car->cmpos.v[2]) * (car->wpos[WHEEL_FL].v[2] - car->cmpos.v[2]) * frontLateralRequest / car->I.v[1] * rearAxleYawContribution;
+
+            if (fabs(denom) > 0.1f) {
+                br_scalar factor = numer / (denom * dt);
+                rearAxleYawContribution *= factor;
+                rearLateralMoment *= factor;
+            }
+
+            frontLateralRequest /= scale;
+            rearLongitudinalRequest /= (car->friction_elipticity * scale);
+        }
+
+        // Remove frontLongitudinalEffective from rearLateralMoment / rearAxleYawContribution
+        rearLateralMoment -= frontLongitudinalEffective;
+        rearAxleYawContribution += (car->wpos[WHEEL_RL].v[2] - car->wpos[WHEEL_FL].v[2]) * car->curvature * frontLongitudinalEffective;
+
+        // Normalize combined rear friction vector if non-zero
+        if (rearCombinedMagnitude > 1e-4f) {
+            frontLateralRequest /= (rearCombinedMagnitude * 2.0f);
+            rearLongitudinalRequest /= (rearCombinedMagnitude * 2.0f);
+        }
+
+        // Back to "elliptical" longitudinal scale
+        rearLongitudinalRequest *= car->friction_elipticity;
+
+        // At this point, rearCombinedMagnitude is the magnitude “per wheel”
+        wheelNormalForce[WHEEL_RL] = rearCombinedMagnitude;
+        wheelNormalForce[WHEEL_RR] = rearCombinedMagnitude;
+
+        car->wheel_slip = 0;
+
+        // ---- Rear slip / skid noise & slip flags ----
+        {
+            int slipMask = (wheelNormalForce[WHEEL_RL] > maxRearLeftFriction) + 2 * (wheelNormalForce[WHEEL_RR] > maxRearRightFriction);
+
+            switch (slipMask) {
+            case 0:
+                slideDist = 0.0f;
+                break;
+
+            case 1: { // RL > max, RR ok
+                wheelNormalForce[WHEEL_RL] = car->freduction * maxRearLeftFriction;
+                wheelNormalForce[WHEEL_RR] = rearCombinedMagnitude - wheelNormalForce[WHEEL_RL] + wheelNormalForce[WHEEL_RR];
+
+                if (wheelNormalForce[WHEEL_RR] > maxRearRightFriction) {
+                    if (maxRearRightFriction > 0.1f) {
+                        br_scalar slipAmount = (wheelNormalForce[WHEEL_RR] - maxRearRightFriction) / maxRearRightFriction;
+                        br_scalar skidThreshold = (&gProgram_state.current_car == car) ? 20.0f : 60.0f;
+
+                        if (slipAmount >= skidThreshold) {
+                            car->new_skidding |= 2u;
+                        }
+
+                        SkidNoise(car, 1, slipAmount, car->material_index[WHEEL_RR]);
+                    }
+                    wheelNormalForce[WHEEL_RR] = car->freduction * maxRearRightFriction;
+                    car->wheel_slip |= 2u;
+                }
+                break;
+            }
+
+            case 2: { // RR > max, RL ok
+                wheelNormalForce[WHEEL_RR] = car->freduction * maxRearRightFriction;
+                wheelNormalForce[WHEEL_RL] = rearCombinedMagnitude - wheelNormalForce[WHEEL_RR] + wheelNormalForce[WHEEL_RL];
+
+                if (wheelNormalForce[WHEEL_RL] > maxRearLeftFriction) {
+                    if (maxRearLeftFriction > 0.1f) {
+                        br_scalar slipAmount = (wheelNormalForce[WHEEL_RL] - maxRearLeftFriction) / maxRearLeftFriction;
+                        br_scalar skidThreshold = (&gProgram_state.current_car == car) ? 20.0f : 60.0f;
+
+                        if (slipAmount >= skidThreshold) {
+                            car->new_skidding |= 1u;
+                        }
+
+                        SkidNoise(car, 0, slipAmount, car->material_index[WHEEL_RL]);
+                    }
+                    wheelNormalForce[WHEEL_RL] = car->freduction * maxRearLeftFriction;
+                    car->wheel_slip |= 2u;
+                }
+                break;
+            }
+
+            case 3: { // both > max
+                wheelNormalForce[WHEEL_RL] = car->freduction * maxRearLeftFriction;
+                wheelNormalForce[WHEEL_RR] = car->freduction * maxRearRightFriction;
+                car->wheel_slip |= 2u;
+
+                br_scalar slipAmount = (rearCombinedMagnitude * 2.0f - maxRearLeftFriction - maxRearRightFriction) / (maxRearRightFriction + maxRearLeftFriction);
+
+                br_scalar skidThreshold = (&gProgram_state.current_car == car) ? 20.0f : 60.0f;
+
+                if (slipAmount >= skidThreshold) {
+                    if (maxRearLeftFriction > 0.1f)
+                        car->new_skidding |= 1u;
+                    if (maxRearRightFriction > 0.1f)
+                        car->new_skidding |= 2u;
+                }
+
+                if (IRandomBetween(0, 1)) {
+                    if (maxRearLeftFriction > 0.1f) {
+                        SkidNoise(car, 0, slipAmount, car->material_index[WHEEL_RL]);
+                    }
+                } else {
+                    if (maxRearRightFriction > 0.1f) {
+                        SkidNoise(car, 1, slipAmount, car->material_index[WHEEL_RR]);
+                    }
+                }
+                break;
+            }
+
+            default:
+                break;
+            }
+        }
+
+        // If we're sliding and the slip direction opposes turn, kill turn_speed for a snap
+        if (car->wheel_slip && car->curvature * car->turn_speed > 0.0f && fabs(frontLateralRequest) > 0.01f && car->curvature * frontLateralRequest < 0.0f && !car->keys.brake && !car->keys.change_down) {
+
+            car->turn_speed = 0.0f;
+        }
+
+        // ---- Front axle friction, very similar logic ----
+        {
+            br_scalar frontCombinedMagnitude = sqrt(rearAxleYawContribution * rearAxleYawContribution + rearLateralMoment * rearLateralMoment) * 0.5f;
+
+            if (frontCombinedMagnitude > 1e-4f) {
+                rearAxleYawContribution /= (frontCombinedMagnitude * 2.0f);
+                rearLateralMoment /= (frontCombinedMagnitude * 2.0f);
+            }
+
+            maxFrontLeftFriction = sqrt(wheelNormalForce[WHEEL_FL]) * car->mu[1] * (flOilFactor * gripMultiplier) * matMods[car->material_index[WHEEL_FL]].tyre_road_friction;
+
+            maxFrontRightFriction = sqrt(wheelNormalForce[WHEEL_FR]) * car->mu[1] * (frOilFactor * gripMultiplier) * matMods[car->material_index[WHEEL_FR]].tyre_road_friction;
+
+            car->max_force_front = maxFrontRightFriction + maxFrontLeftFriction;
+
+            wheelNormalForce[WHEEL_FL] = frontCombinedMagnitude;
+            wheelNormalForce[WHEEL_FR] = frontCombinedMagnitude;
+
+            int frontSlipMask = (frontCombinedMagnitude > maxFrontLeftFriction) + 2 * (frontCombinedMagnitude > maxFrontRightFriction);
+
+            switch (frontSlipMask) {
+            case 1: { // FL > max, FR ok
+                wheelNormalForce[WHEEL_FL] = car->freduction * maxFrontLeftFriction;
+                wheelNormalForce[WHEEL_FR] = frontCombinedMagnitude - wheelNormalForce[WHEEL_FL] + wheelNormalForce[WHEEL_FR];
+
+                if (wheelNormalForce[WHEEL_FR] > maxFrontRightFriction) {
+                    if (maxFrontRightFriction > 0.1f) {
+                        br_scalar slipAmount = (wheelNormalForce[WHEEL_FR] - maxFrontRightFriction) / maxFrontRightFriction;
+                        br_scalar skidThreshold = (&gProgram_state.current_car == car) ? 20.0f : 60.0f;
+
+                        if (slipAmount >= skidThreshold) {
+                            car->new_skidding |= 8u;
+                        }
+
+                        SkidNoise(car, 3, slipAmount, car->material_index[WHEEL_FR]);
+                    }
+                    wheelNormalForce[WHEEL_FR] = car->freduction * maxFrontRightFriction;
+                    car->wheel_slip |= 1u;
+                }
+                break;
+            }
+
+            case 2: { // FR > max, FL ok
+                wheelNormalForce[WHEEL_FR] = car->freduction * maxFrontRightFriction;
+                wheelNormalForce[WHEEL_FL] = frontCombinedMagnitude - wheelNormalForce[WHEEL_FR] + wheelNormalForce[WHEEL_FL];
+
+                if (wheelNormalForce[WHEEL_FL] > maxFrontLeftFriction) {
+                    if (maxFrontLeftFriction > 0.1f) {
+                        br_scalar slipAmount = (wheelNormalForce[WHEEL_FL] - maxFrontLeftFriction) / maxFrontLeftFriction;
+                        br_scalar skidThreshold = (&gProgram_state.current_car == car) ? 20.0f : 60.0f;
+
+                        if (slipAmount >= skidThreshold) {
+                            car->new_skidding |= 4u;
+                        }
+
+                        SkidNoise(car, 2, slipAmount, car->material_index[WHEEL_FL]);
+                    }
+                    wheelNormalForce[WHEEL_FL] = car->freduction * maxFrontLeftFriction;
+                    car->wheel_slip |= 1u;
+                }
+                break;
+            }
+
+            case 3: { // both > max
+                wheelNormalForce[WHEEL_FL] = car->freduction * maxFrontLeftFriction;
+                wheelNormalForce[WHEEL_FR] = car->freduction * maxFrontRightFriction;
+                car->wheel_slip |= 1u;
+
+                br_scalar slipAmount = (frontCombinedMagnitude * 2.0f - maxFrontLeftFriction - maxFrontRightFriction) / (maxFrontRightFriction + maxFrontLeftFriction);
+
+                br_scalar skidThreshold = (&gProgram_state.current_car == car) ? 20.0f : 60.0f;
+
+                if (slipAmount >= skidThreshold) {
+                    if (maxFrontLeftFriction > 0.1f)
+                        car->new_skidding |= 4u;
+                    if (maxFrontRightFriction > 0.1f)
+                        car->new_skidding |= 8u;
+                }
+
+                if (IRandomBetween(0, 1)) {
+                    if (maxFrontLeftFriction > 0.1f) {
+                        SkidNoise(car, 2, slipAmount, car->material_index[WHEEL_FL]);
+                    }
+                } else {
+                    if (maxFrontRightFriction > 0.1f) {
+                        SkidNoise(car, 3, slipAmount, car->material_index[WHEEL_FR]);
+                    }
+                }
+                break;
+            }
+
+            default:
+                break;
+            }
+
+            // ---- Build combined force directions for rear / front axles ----
+
+            // Rear: combination of longitudinal (rightDirOnRoad) and lateral (tangentDirOnRoad)
+            BrVector3Scale(&rearForceDir, &rightDirOnRoad, rearLongitudinalRequest);
+            BrVector3Scale(&tmpVec, &tangentDirOnRoad, frontLateralRequest);
+            BrVector3Accumulate(&rearForceDir, &tmpVec);
+
+            // Front: combination using rearLateralMoment / rearAxleYawContribution
+            BrVector3Scale(&frontForceDir, &rightDirOnRoad, rearLateralMoment);
+            BrVector3Scale(&tmpVec, &tangentDirOnRoad, rearAxleYawContribution);
+            BrVector3Accumulate(&frontForceDir, &tmpVec);
+        }
+
+        // ---- Apply tyre forces at wheel contact positions ----
+
+        // Rear-left
+        {
+            br_vector3 r = car->wpos[WHEEL_RL];
+            r.v[1] -= car->oldd[WHEEL_RL];
+            BrVector3Sub(&r, &r, &car->cmpos);
+
+            BrVector3Scale(&tmpVec, &rearForceDir, wheelNormalForce[WHEEL_RL]);
+            BrVector3Accumulate(&netForceCar, &tmpVec);
+
+            BrVector3Cross(&tmpTorqueVec, &r, &tmpVec);
+            BrVector3Accumulate(&netTorqueCar, &tmpTorqueVec);
+        }
+
+        // Rear-right
+        {
+            br_vector3 r = car->wpos[WHEEL_RR];
+            r.v[1] -= car->oldd[WHEEL_RR];
+            BrVector3Sub(&r, &r, &car->cmpos);
+
+            BrVector3Scale(&tmpVec, &rearForceDir, wheelNormalForce[WHEEL_RR]);
+            BrVector3Accumulate(&netForceCar, &tmpVec);
+
+            BrVector3Cross(&tmpTorqueVec, &r, &tmpVec);
+            BrVector3Accumulate(&netTorqueCar, &tmpTorqueVec);
+        }
+
+        // Front-left
+        {
+            br_vector3 r = car->wpos[WHEEL_FL];
+            r.v[1] -= car->oldd[WHEEL_FL];
+            BrVector3Sub(&r, &r, &car->cmpos);
+
+            BrVector3Scale(&tmpVec, &frontForceDir, wheelNormalForce[WHEEL_FL]);
+            BrVector3Accumulate(&netForceCar, &tmpVec);
+
+            BrVector3Cross(&tmpTorqueVec, &r, &tmpVec);
+            BrVector3Accumulate(&netTorqueCar, &tmpTorqueVec);
+        }
+
+        // Front-right
+        {
+            br_vector3 r = car->wpos[WHEEL_FR];
+            r.v[1] -= car->oldd[WHEEL_FR];
+            BrVector3Sub(&r, &r, &car->cmpos);
+
+            BrVector3Scale(&tmpVec, &frontForceDir, wheelNormalForce[WHEEL_FR]);
+            BrVector3Accumulate(&netForceCar, &tmpVec);
+
+            BrVector3Cross(&tmpTorqueVec, &r, &tmpVec);
+            BrVector3Accumulate(&netTorqueCar, &tmpTorqueVec);
+        }
+
+    } else {
+        // No wheels on ground = no tyre forces
+        car->max_force_front = 0.0f;
+        car->max_force_rear = 0.0f;
+        StopSkid(car);
+    }
+
+    // ---- Final integration of forces / torques ----
+    car->number_of_wheels_on_ground = numContactNormals;
+
+    // Transform net force from car space to world space
+    BrMatrix34ApplyV(&tmpVec, &netForceCar, carMatrix);
+
+    // Apply torque in car space (scaled by dt)
+    BrVector3Scale(&tmpTorqueVec, &netTorqueCar, dt);
+    ApplyTorque(car, &tmpTorqueVec);
+
+    // Linear acceleration = F / M, integrate velocity
+    BrVector3Scale(&tmpTorqueVec, &tmpVec, dt / car->M);
+    BrVector3Accumulate(&car->v, &tmpTorqueVec);
+
+    // ---- "Stop" logic when nearly resting ----
+    if (car->speed < 0.0001f && ((!car->keys.acc && car->joystick.acc <= 0) || !car->gear) && !car->keys.dec && car->joystick.dec <= 0 && car->bounce_rate == 0.0f && BrVector3Length(&car->omega) < 0.05f) {
+
+        br_scalar effectiveWeight;
+
+        if (volume) {
+            br_scalar gravMul = (car->driver > eDriver_non_car && car->underwater_ability)
+                ? (1.0f - (1.0f - volume->gravity_multiplier) * 0.6f)
+                : volume->gravity_multiplier;
+            effectiveWeight = BrVector3Length(&tmpVec) / gravMul / gGravity_multiplier;
+        } else {
+            effectiveWeight = BrVector3Length(&tmpVec);
+        }
+
+        if (car->M > effectiveWeight || (car->keys.brake && numContactNormals >= 3)) {
+
+            if (stopTimer == 100.0f) {
+                stopTimer = 0.0f;
+            }
+
+            if (stopTimer > 0.5f) {
+                BrVector3SetFloat(&car->v, 0.0f, 0.0f, 0.0f);
+                BrVector3SetFloat(&car->omega, 0.0f, 0.0f, 0.0f);
+                stopTimer = 0.5f;
+            }
+        }
+    }
+
+    stopTimer += dt;
+    if (stopTimer > 1.0f) {
+        stopTimer = 100.0f;
+    }
+
+    // ---- Aerodynamic / general drag ----
+    AddDrag(car, dt);
+
+    // ---- For human drivers in net mode, track rear longitudinal accel force ----
+    if (car->driver >= eDriver_net_human) {
+        // "rearForceDir" holds the rear axle force direction in car space
+        car->acc_force = -(rearForceDir.v[2] * wheelNormalForce[WHEEL_RL]) - (rearForceDir.v[2] * wheelNormalForce[WHEEL_RR]);
+        // LOG_DEBUG("old %f new %f", old, car->acc_force);
+    }
+}
+
 // IDA: void __usercall CalcForce(tCar_spec *c@<EAX>, br_scalar dt)
 // FUNCTION: CARM95 0x0047ba5d
-void CalcForce(tCar_spec* c, br_scalar dt) {
+void CalcForceOrig(tCar_spec* c, br_scalar dt) {
     int n;
     int normnum;
     int i;
@@ -2766,6 +3643,14 @@ void CalcForce(tCar_spec* c, br_scalar dt) {
         // LOG_DEBUG("old %f new %f", old, c->acc_force);
     }
 }
+
+void CalcForce(tCar_spec* c, br_scalar dt) {
+    // pick one or another
+    
+    //CalcForce_ChatGpt(c, dt);
+    CalcForceOrig(c, dt);
+}
+
 
 // IDA: void __usercall DoRevs(tCar_spec *c@<EAX>, br_scalar dt)
 // FUNCTION: CARM95 0x0047ef8e
