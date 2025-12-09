@@ -7,7 +7,6 @@ target_include_directories(dethrace_test PRIVATE
     .
     ${CMAKE_SOURCE_DIR}/lib
     ${CMAKE_SOURCE_DIR}/src/harness
-    ${CMAKE_SOURCE_DIR}/lib/BRender-v1.3.2
     ${CMAKE_SOURCE_DIR}/src/DETHRACE
     ${CMAKE_SOURCE_DIR}/src/DETHRACE/common
     ${CMAKE_SOURCE_DIR}/src/DETHRACE/pd

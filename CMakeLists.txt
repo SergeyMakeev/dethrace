@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.23)
 
 if(NOT DEFINED CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Debug" CACHE STRING "Choose the type of build, options are: Debug Release RelWithDebInfo" FORCE)
@@ -6,6 +6,8 @@ endif()
 
 project(dethrace C)
 
+# Note: FindSDL2.cmake is no longer needed as we use FetchContent for SDL2,
+# but we still need the cmake directory for other modules like GetGitRevisionDescription
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake/")
 
 if(MSVC)
@@ -16,6 +18,7 @@ endif()
 include(CheckCCompilerFlag)
 include(CMakeDependentOption)
 include(TestBigEndian)
+include(FetchContent)
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
     file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" DETHRACE_VERSION)
@@ -99,12 +102,13 @@ if(DETHRACE_PLATFORM_SDL1)
 endif()
 
 if(DETHRACE_PLATFORM_SDL2)
-    find_package(SDL2 CONFIG)
-
-    if(NOT SDL2_FOUND)
-        find_package(SDL2 MODULE REQUIRED)
-    endif()
-
+    FetchContent_Declare(
+        SDL2
+        GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+        GIT_TAG        release-2.30.0
+    )
+    FetchContent_MakeAvailable(SDL2)
+    
     list(APPEND DETHRACE_PLATFORMS SDL2)
     math(EXPR count_sdl_platforms "${count_sdl_platforms} + 1")
 endif()
@@ -130,7 +134,13 @@ if(NOT DETHRACE_PLATFORMS AND NOT MSVC_42_FOR_RECCMP)
     message(FATAL_ERROR "No platform drivers enabled")
 endif()
 
-add_subdirectory(lib/BRender-v1.3.2)
+# Fetch BRender-v1.3.2 using FetchContent
+FetchContent_Declare(
+    BRender-v1.3.2
+    GIT_REPOSITORY https://github.com/dethrace-labs/BRender-v1.3.2.git
+    GIT_TAG        main
+)
+FetchContent_MakeAvailable(BRender-v1.3.2)
 add_subdirectory(lib/libsmacker)
 add_subdirectory(lib/inih)
 
